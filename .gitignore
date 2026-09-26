@@ -1,0 +1,9 @@
+# Secrets — never commit these
+creds.json
+*.creds.json
+.env
+
+# Local environment / debug output
+.venv/
+__pycache__/
+debug/
