@@ -39,6 +39,7 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           USE_BROWSER_FALLBACK: "1"
           PW_CHANNEL: chrome     # Google Chrome is pre-installed on GitHub runners → no browser download
+          PRIVATE_LOGS: "1"      # public repo → logs are public: hide links, prices, IDs
           PYTHONUNBUFFERED: "1"
         run: python scraper.py
 
