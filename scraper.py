@@ -559,16 +559,24 @@ def check_noon(url: str, http: HttpClient, browser: Browser) -> Result:
     canonical = f"https://www.noon.com/{loc}/{path}/"
     parts = path.split("/")
     sku = parts[-2] if len(parts) >= 2 else None
-    last_err = None
+    errors: list[str] = []
+
+    # Path variants: app share links ("<SKU>/p") are rejected more often from datacenter IPs,
+    # while the same product with a slug works → try several forms, fresh fingerprint each time.
+    api_paths = [path]
+    if sku:
+        for alt in (f"{sku}/p", f"x/{sku}/p", f"product/{sku}/p"):
+            if alt not in api_paths:
+                api_paths.append(alt)
+    api_paths = api_paths[:3]
 
     # 1) Internal catalog API (fast, JSON). Undocumented → may change; fallbacks below.
-    api_url = f"https://www.noon.com/_svc/catalog/api/v3/u/{path}/"
-    for attempt in range(1, 3):
+    for attempt, api_path in enumerate(api_paths, 1):
         s = http.session("noon")
         try:
-            r = s.get(api_url, timeout=30, headers={
+            r = s.get(f"https://www.noon.com/_svc/catalog/api/v3/u/{api_path}/", timeout=30, headers={
                 "Accept": "application/json, text/plain, */*",
-                "Referer": canonical,
+                "Referer": f"https://www.noon.com/egypt-en/{api_path}/",
                 "x-locale": "en-eg",
                 "x-mp": "noon",
                 "x-platform": "web",
@@ -579,33 +587,36 @@ def check_noon(url: str, http: HttpClient, browser: Browser) -> Result:
                 if res:
                     res.url = canonical
                     return res
-                last_err = "api: unexpected JSON shape"
-                break
-            last_err = f"api HTTP {r.status_code}"
-            if r.status_code == 404:
-                break
+                errors.append("api JSON?")
+            else:
+                errors.append(f"api {r.status_code}")
         except Exception as e:
-            last_err = f"api network: {e}"
+            errors.append(f"api net:{type(e).__name__}")
+        log.info("   api attempt %d: %s", attempt, errors[-1])
         http.rotate("noon")
         backoff(attempt)
 
-    # 2) Product page HTML (JSON-LD / __NEXT_DATA__)
-    try:
-        r = http.session("noon").get(canonical, timeout=30,
-                                     headers={"Referer": "https://www.noon.com/egypt-en/"})
-        if r.status_code == 404:
-            return Result(url=canonical, status="NOT_FOUND", error="HTTP 404")
-        if 200 <= r.status_code < 300:
-            res = parse_noon_html(r.text)
-            if res:
-                res.url, res.source = canonical, "noon-html"
-                return res
-            dump_debug("noon_html_noprice", r.text)
-            last_err = "html: price not found"
-        else:
-            last_err = f"html HTTP {r.status_code}"
-    except Exception as e:
-        last_err = f"html network: {e}"
+    # 2) Product page HTML (JSON-LD / __NEXT_DATA__) — stored URL, then the website form
+    pages = [canonical]
+    web_form = f"https://www.noon.com/egypt-en/{path}/"
+    if web_form != canonical:
+        pages.append(web_form)
+    for page in pages:
+        try:
+            r = http.session("noon").get(page, timeout=30,
+                                         headers={"Referer": "https://www.noon.com/egypt-en/"})
+            if 200 <= r.status_code < 300:
+                res = parse_noon_html(r.text)
+                if res:
+                    res.url, res.source = canonical, "noon-html"
+                    return res
+                dump_debug("noon_html_noprice", r.text)
+                errors.append("html no price")
+            else:
+                errors.append(f"html {r.status_code}")
+        except Exception as e:
+            errors.append(f"html net:{type(e).__name__}")
+        http.rotate("noon")
 
     # 3) Full JS rendering
     if browser.enabled:
@@ -618,8 +629,11 @@ def check_noon(url: str, http: HttpClient, browser: Browser) -> Result:
                 return res
             dump_debug("noon_browser_noprice", body)
 
-    blocked = any(x in (last_err or "") for x in ("403", "429", "503"))
-    return Result(url=canonical, status="BLOCKED" if blocked else "ERROR", error=last_err)
+    summary = ", ".join(errors)
+    if errors and all(" 404" in e for e in errors):
+        return Result(url=canonical, status="NOT_FOUND", error=summary)
+    blocked = any(x in summary for x in ("403", "429", "503"))
+    return Result(url=canonical, status="BLOCKED" if blocked else "ERROR", error=summary)
 
 
 # ─────────────────────────── Dispatch ───────────────────────────
@@ -853,7 +867,8 @@ def run(dry_run: bool) -> int:
                 "current": current if current is not None else "",
                 "lowest": lowest if lowest is not None else "",
                 "checked": now,
-                "status": res.status,
+                "status": res.status if res.status == "OK" or not res.error
+                          else f"{res.status}: {res.error}"[:120],
                 "last_alert": last_alert if last_alert is not None else "",
             }
             if p.start is None and start is not None:
