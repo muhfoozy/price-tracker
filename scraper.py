@@ -2,7 +2,7 @@
 """
 Price Tracker — Amazon.eg & Noon Egypt
 Reads products from Google Sheets, checks current prices, and sends
-Telegram alerts when a price drops to (or below) the target.
+Telegram alerts whenever a price goes up or down.
 
 Environment variables
 ---------------------
@@ -51,7 +51,7 @@ SHEET_NAME = "Products"
 CHANGE_THRESHOLD = 0  # EGP — 0 = notify on ANY price change (up or down)
 
 HEADERS = [
-    "ID", "Name", "Store", "URL", "Target Price", "Current Price",
+    "ID", "Name", "Store", "URL", "Start Price", "Current Price",
     "Lowest Price", "Last Checked", "Status", "Last Alert Price", "Added At",
 ]
 COL = {h: i for i, h in enumerate(HEADERS)}  # 0-based
@@ -136,7 +136,7 @@ class Product:
     name: str
     store: str
     url: str
-    target: float
+    start: float | None      # price when tracking began
     current: float | None
     lowest: float | None
     last_alert: float | None
@@ -671,23 +671,21 @@ def _store_label(url: str) -> str:
     return "Amazon" if detect_store(url) == "amazon" else "Noon"
 
 
-def _target_line(price: float, target: float) -> str:
-    if price <= target:
-        return f"🎯 Target: {fmt_money(target)}  ✅ <b>reached</b>"
-    return f"🎯 Target: {fmt_money(target)}  ({fmt_money(price - target)} to go)"
+def _since_start(price: float, start: float | None) -> str | None:
+    if not start or abs(price - start) < 0.01:
+        return None
+    d = price - start
+    return f"🗓️ Since added: {'−' if d < 0 else '+'}{fmt_money(abs(d))} ({abs(d) / start * 100:.1f}%) from {fmt_money(start)}"
 
 
 def msg_first_check(p: Product, res: Result) -> str:
     esc = htmllib.escape
     name = res.title or p.name or f"Product #{p.id}"
-    head = (f"🎯 <b>Already at your target, {USER_NAME}!</b>" if res.price <= p.target
-            else "🆕 <b>Now tracking</b>")
     return "\n".join([
-        head, "",
+        "🆕 <b>Now tracking</b>", "",
         f"📦 {esc(name[:150])}",
         f"🏪 {_store_label(p.url)} · #{p.id}",
-        f"💰 Current: <b>{fmt_money(res.price)}</b>",
-        _target_line(res.price, p.target),
+        f"💰 Current price: <b>{fmt_money(res.price)}</b>",
         "🔔 You'll be notified whenever the price changes.",
         "",
         f'🔗 <a href="{esc(res.url or p.url)}">Open product</a>',
@@ -695,26 +693,27 @@ def msg_first_check(p: Product, res: Result) -> str:
 
 
 def msg_price_change(p: Product, res: Result, before: float, lowest: float | None,
-                     target_crossed: bool) -> str:
+                     start: float | None) -> str:
     esc = htmllib.escape
     name = res.title or p.name or f"Product #{p.id}"
     diff = res.price - before
     pct = f"{abs(diff) / before * 100:.1f}%" if before else ""
     if diff < 0:
         move = f"📉 <b>Price dropped −{fmt_money(abs(diff))}</b> ({pct})"
-    elif diff > 0:
-        move = f"📈 <b>Price went up +{fmt_money(diff)}</b> ({pct})"
+        if lowest is not None and res.price <= lowest:
+            move += "\n🏆 <b>Lowest price seen so far!</b>"
     else:
-        move = "➖ <b>Price unchanged</b>"
-    lines = []
-    if target_crossed:
-        lines += [f"🎯🔥 <b>Target reached, {USER_NAME}!</b>"]
-    lines += [
+        move = f"📈 <b>Price went up +{fmt_money(diff)}</b> ({pct})"
+    lines = [
         move, "",
         f"📦 {esc(name[:150])}",
         f"🏪 {_store_label(p.url)} · #{p.id}",
         f"💰 Now: <b>{fmt_money(res.price)}</b>  (was {fmt_money(before)})",
-        _target_line(res.price, p.target),
+    ]
+    since = _since_start(res.price, start)
+    if since:
+        lines.append(since)
+    lines += [
         f"📊 Lowest seen: {fmt_money(lowest)}",
         "",
         f'🔗 <a href="{esc(res.url or p.url)}">Open product</a>',
@@ -748,19 +747,18 @@ def read_products(ws) -> list[Product]:
     for row in rows[1:]:
         row = list(row) + [""] * (len(HEADERS) - len(row))
         url = str(row[COL["URL"]]).strip()
-        target = _num(row[COL["Target Price"]])
         try:
             pid = int(float(row[COL["ID"]]))
         except (TypeError, ValueError):
             continue
-        if not url or not target:
+        if not url:
             continue
         out.append(Product(
             id=pid,
             name=str(row[COL["Name"]] or ""),
             store=str(row[COL["Store"]] or ""),
             url=url,
-            target=target,
+            start=_num(row[COL["Start Price"]]),
             current=_num(row[COL["Current Price"]]),
             lowest=_num(row[COL["Lowest Price"]]),
             last_alert=_num(row[COL["Last Alert Price"]]),
@@ -784,6 +782,8 @@ def write_updates(ws, updates: dict[int, dict]) -> None:
         values.append({"range": f"F{r}:J{r}", "values": [[
             u["current"], u["lowest"], u["checked"], u["status"], u["last_alert"],
         ]]})
+        if u.get("start") is not None:
+            values.append({"range": f"E{r}", "values": [[u["start"]]]})
         if u.get("name"):
             texts.append({"range": f"B{r}", "values": [[u["name"]]]})
         if u.get("url"):
@@ -831,17 +831,16 @@ def run(dry_run: bool) -> int:
             baseline = p.last_alert  # price at the last notification ("Last Alert Price" column)
             msg = None
 
+            start = p.start if p.start is not None else price  # first successful price = start
+
             if price is not None:
                 if baseline is None:
-                    # New product (or target changed via /add) → report the starting price
+                    # New product → report the starting price
                     msg = msg_first_check(p, res)
                     stats["first_check"] += 1
-                else:
-                    was_hit = baseline <= p.target
-                    crossed = price <= p.target and not was_hit
-                    if abs(price - baseline) >= max(CHANGE_THRESHOLD, 0.01):  # any real change
-                        msg = msg_price_change(p, res, baseline, lowest, crossed)
-                        stats["target_hits" if crossed else "changes"] += 1
+                elif abs(price - baseline) >= max(CHANGE_THRESHOLD, 0.01):  # any real change
+                    msg = msg_price_change(p, res, baseline, lowest, start)
+                    stats["changes"] += 1
                 if msg:
                     log.info("   🔔 NOTIFY sent (%s)", "first check" if baseline is None else
                              ("price up" if price > baseline else "price down"))
@@ -857,6 +856,8 @@ def run(dry_run: bool) -> int:
                 "status": res.status,
                 "last_alert": last_alert if last_alert is not None else "",
             }
+            if p.start is None and start is not None:
+                u["start"] = start
             if res.title and (not p.name or p.name.startswith("(pending")):
                 u["name"] = res.title[:200]
             if res.url and res.url != p.url:
