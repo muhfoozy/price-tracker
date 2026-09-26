@@ -87,12 +87,35 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+# PRIVATE_LOGS: public GitHub repos expose Actions logs to everyone → hide links, prices, tokens.
+# Default: private on GitHub Actions, verbose on your own PC. Override with PRIVATE_LOGS=0/1.
+PRIVATE_LOGS = os.getenv("PRIVATE_LOGS", "1" if os.getenv("GITHUB_ACTIONS") else "0") == "1"
+
+_REDACT = [
+    (re.compile(r"bot\d+:[\w-]{20,}"), "bot<token>"),   # Telegram bot token inside URLs
+    (re.compile(r"https?://\S+"), "<url>"),             # any link (products, sheet, APIs)
+    (re.compile(r"\b[A-Z0-9]{10}\b"), "<id>"),           # ASINs / SKUs
+]
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        text = super().format(record)  # includes tracebacks
+        if PRIVATE_LOGS:
+            for rx, sub in _REDACT:
+                text = rx.sub(sub, text)
+        return text
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(RedactingFormatter("%(asctime)s | %(levelname)-7s | %(message)s", "%H:%M:%S"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("tracker")
+
+
+def money_log(v) -> str:
+    """Prices in logs: hidden when PRIVATE_LOGS."""
+    return "•••" if PRIVATE_LOGS else fmt_money(v)
 
 
 # ──────────────────────────── Models ────────────────────────────
@@ -796,10 +819,10 @@ def run(dry_run: bool) -> int:
         for i, p in enumerate(products):
             if i:
                 human_pause(4, 9)
-            log.info("#%s  %s", p.id, p.url)
+            log.info("#%s  %s", p.id, _store_label(p.url) if PRIVATE_LOGS else p.url)
             res = check_url(p.url, http, browser)
             stats[res.status] += 1
-            log.info("   → %s | %s | %s%s", res.status, fmt_money(res.price), res.source or "-",
+            log.info("   → %s | %s | %s%s", res.status, money_log(res.price), res.source or "-",
                      f" | {res.error}" if res.error else "")
 
             price = res.price if res.status == "OK" else None
@@ -820,8 +843,8 @@ def run(dry_run: bool) -> int:
                         msg = msg_price_change(p, res, baseline, lowest, crossed)
                         stats["target_hits" if crossed else "changes"] += 1
                 if msg:
-                    log.info("   🔔 NOTIFY: %s (baseline %s, target %s)",
-                             fmt_money(price), fmt_money(baseline), fmt_money(p.target))
+                    log.info("   🔔 NOTIFY sent (%s)", "first check" if baseline is None else
+                             ("price up" if price > baseline else "price down"))
                     if not dry_run:
                         send_telegram(msg)
                     baseline = price
@@ -858,8 +881,15 @@ def run(dry_run: bool) -> int:
     return 0
 
 
+def _private_excepthook(exc_type, exc, tb):
+    # Uncaught errors (e.g. gspread) would print URLs/IDs to the public log → route through the redactor
+    log.critical("Unhandled error", exc_info=(exc_type, exc, tb))
+
+
 def main() -> None:
     global DEBUG_DIR
+    if PRIVATE_LOGS:
+        sys.excepthook = _private_excepthook
     ap = argparse.ArgumentParser(description="Amazon.eg / Noon Egypt price tracker")
     ap.add_argument("--dry-run", action="store_true", help="no sheet writes, no alerts")
     ap.add_argument("--test", metavar="URL", help="check a single URL and print the result")
