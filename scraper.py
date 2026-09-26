@@ -48,7 +48,7 @@ USER_NAME = "foozy"
 CURRENCY = "EGP"
 TZ = ZoneInfo("Africa/Cairo")
 SHEET_NAME = "Products"
-CHANGE_THRESHOLD = 10  # EGP — notify on any move (up or down) of at least this much
+CHANGE_THRESHOLD = 0  # EGP — 0 = notify on ANY price change (up or down)
 
 HEADERS = [
     "ID", "Name", "Store", "URL", "Target Price", "Current Price",
@@ -665,7 +665,7 @@ def msg_first_check(p: Product, res: Result) -> str:
         f"🏪 {_store_label(p.url)} · #{p.id}",
         f"💰 Current: <b>{fmt_money(res.price)}</b>",
         _target_line(res.price, p.target),
-        f"🔔 You'll be notified on every change of {CHANGE_THRESHOLD}+ {CURRENCY}.",
+        "🔔 You'll be notified whenever the price changes.",
         "",
         f'🔗 <a href="{esc(res.url or p.url)}">Open product</a>',
     ])
@@ -814,9 +814,9 @@ def run(dry_run: bool) -> int:
                     msg = msg_first_check(p, res)
                     stats["first_check"] += 1
                 else:
-                    was_hit = p.current is not None and p.current <= p.target
+                    was_hit = baseline <= p.target
                     crossed = price <= p.target and not was_hit
-                    if crossed or abs(price - baseline) >= CHANGE_THRESHOLD:
+                    if abs(price - baseline) >= max(CHANGE_THRESHOLD, 0.01):  # any real change
                         msg = msg_price_change(p, res, baseline, lowest, crossed)
                         stats["target_hits" if crossed else "changes"] += 1
                 if msg:
