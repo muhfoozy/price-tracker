@@ -1,0 +1,51 @@
+name: Price Tracker
+
+on:
+  schedule:
+    - cron: "2,17,32,47 * * * *"   # every 15 minutes (off the :00 rush → fewer GitHub delays)
+  workflow_dispatch:             # "Run workflow" button for manual runs
+
+permissions:
+  contents: read
+  actions: write                 # needed by the keep-alive step below
+
+concurrency:                     # never run two checks at the same time
+  group: price-tracker
+  cancel-in-progress: false
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14            # never overlap the next 15-min run
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check prices
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          USE_BROWSER_FALLBACK: "1"
+          PW_CHANNEL: chrome     # Google Chrome is pre-installed on GitHub runners → no browser download
+          PYTHONUNBUFFERED: "1"
+        run: python scraper.py
+
+      # GitHub disables scheduled workflows after 60 days without repo activity.
+      # Re-enabling the workflow via the API resets that timer (no commits needed).
+      - name: Keep schedule alive
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/tracker.yml/enable" || true

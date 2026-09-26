@@ -443,7 +443,9 @@ def check_amazon(url: str, http: HttpClient, browser: Browser) -> Result:
 
 # ──────────────────────────── Noon ──────────────────────────────
 
-NOON_RE = re.compile(r"noon\.com/egypt-(?:en|ar)/(.+?/p)(?:/|$|\?)", re.I)
+# Both styles: /egypt-en/<slug>/<SKU>/p/  (website)  and  /en-eg/<SKU>/p/  (app share links)
+NOON_RE = re.compile(r"noon\.com/(egypt-en|egypt-ar|en-eg|ar-eg)/(.+?/p)(?=/|\?|#|$)", re.I)
+NOON_LOCALE_EN = {"egypt-ar": "egypt-en", "ar-eg": "en-eg"}
 
 NOON_PRICE_SELECTORS = [
     '[data-qa="div-price-now"]',
@@ -528,8 +530,10 @@ def check_noon(url: str, http: HttpClient, browser: Browser) -> Result:
     m = NOON_RE.search(url)
     if not m:
         return Result(status="NOT_FOUND", error="unrecognized Noon URL")
-    path = m.group(1)                                 # "<slug>/<SKU>/p"
-    canonical = f"https://www.noon.com/egypt-en/{path}/"
+    loc = m.group(1).lower()
+    loc = NOON_LOCALE_EN.get(loc, loc)
+    path = m.group(2)                                 # "<slug>/<SKU>/p"  or  "<SKU>/p"
+    canonical = f"https://www.noon.com/{loc}/{path}/"
     parts = path.split("/")
     sku = parts[-2] if len(parts) >= 2 else None
     last_err = None
